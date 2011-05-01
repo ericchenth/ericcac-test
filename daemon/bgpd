@@ -1,0 +1,397 @@
+#!/usr/bin/env python
+# encoding: utf-8
+"""
+bgp.py
+
+Created by Thomas Mangin on 2009-08-30.
+Copyright (c) 2009 Exa Networks. All rights reserved.
+"""
+
+import sys
+import os
+import pwd
+import time
+import signal
+import socket
+import errno
+import subprocess
+import select
+
+from bgp.network.peer import Peer
+
+from bgp.log import Logger
+logger = Logger()
+
+
+class Supervisor (object):
+	pid_file = os.environ.get('PID','')
+	user = os.environ.get('USER','nobody')
+
+	# import os
+	# [hex(ord(c)) for c in os.popen('clear').read()]
+	clear = ''.join([chr(int(c,16)) for c in ['0x1b', '0x5b', '0x48', '0x1b', '0x5b', '0x32', '0x4a']])
+
+	def __init__ (self,configuration):
+		self.configuration = configuration
+		self._proc = {}
+		self.watchdog = {}
+		self._peers = {}
+		self._shutdown = False
+		self._reload = False
+		self._restart = False
+		self._saved_pid = False
+		self.reload()
+
+		mask = os.umask(0137)
+		signal.signal(signal.SIGTERM, self.sigterm)
+		signal.signal(signal.SIGHUP, self.sighup)
+		signal.signal(signal.SIGALRM, self.sigalrm)
+
+	def _is_socket (self,fd):
+		try:
+			s = socket.fromfd(fd, socket.AF_INET, socket.SOCK_RAW)
+		except ValueError,e:
+			# The file descriptor is closed
+			return False
+		try:
+			what = s.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+		except socket.error, e:
+			# It is look like one but it is not a socket ...
+			if e.args[0] == errno.ENOTSOCK:
+				return False
+		return True
+
+	def fork (self):
+		if os.environ.get('DAEMONIZE','0') not in ['','1','yes','Yes','YES']:
+			return
+		
+		def fork_exit ():
+			try:
+				pid = os.fork()
+				if pid > 0:
+					os._exit(0)
+			except OSError, e:
+				logger.critial('Can not fork, errno %d : %s' % (e.errno,e.strerror),'supervisor')
+
+		# do not detach if we are already supervised or run by init like process
+		if self._is_socket(sys.__stdin__.fileno()) or os.getppid() != 1:
+			fork_exit()
+			os.setsid()
+			fork_exit()
+			if not os.environ.get('SYSLOG',''):
+				# XXX: Force SYSLOG, we need to be able to access the local syslog deamon
+				# os.environ['SYSLOG']='??'
+				pass
+
+	def _terminate_watchdog (self,name):
+		logger.supervisor("Terminating watchdog %s" % name)
+		self._proc[name].terminate()
+		self._proc[name].wait()
+		del self._proc[name]
+
+	def terminate_watchdogs (self):
+		for name in list(self._proc):
+			self._terminate_watchdog(name)
+
+	def _new_watchdog (self,name):
+		try:
+			if name in self._proc:
+				logger.supervisor("Can not start watchdog, it is alrady running")
+				return
+			if not name in self.configuration.watchdog:
+				logger.supervisor("Can not start watchdog, no configuration for it (anymore ?)")
+				return
+			self._proc[name] = subprocess.Popen([self.configuration.watchdog[name],],
+				shell=True,
+				stdin=subprocess.PIPE,
+				stdout=subprocess.PIPE,
+			)
+			logger.supervisor("Forked watchdog %s" % name)
+		except (subprocess.CalledProcessError,OSError,ValueError):
+			logger.supervisor("Could not start watchdog %s" % name)
+
+	def fork_watchdogs (self):
+		for name in self.configuration.watchdog:
+			self._new_watchdog(name)
+		for name in list(self._proc):
+			if not name in self.configuration.watchdog:
+				self._terminate_watchdog(name)
+
+	def read_watchdogs (self):
+		lines = {}
+		for name in list(self._proc):
+			try:
+				proc = self._proc[name]
+				r = True
+				while r:
+					r,_,_ = select.select([proc.stdout,],[],[],0)
+					if r:
+						# XXX: readline is blocking, so we are taking the assuption that it will not block
+						# XXX: most likely not going to but perhaps the code should be more robust ?
+						line = proc.stdout.readline().rstrip()
+						if not line:
+							# It seems that when we send ^C this is passed to the children to
+							# And if they do not intercept it correctly, select.select returns but
+							# there is not data to read
+							r = False
+						else:
+							logger.supervisor("Command from watchdog %s : %s " % (name,line))
+							lines.setdefault(name,[]).append(line)
+			except (subprocess.CalledProcessError,OSError,ValueError):
+				logger.supervisor("Issue with the watchdog, terminating it and restarting it")
+				self._terminate_watchdog(name)
+				self._new_watchdog(name)
+				
+		return lines
+
+	def savepid (self):
+		if not self.pid_file:
+			return
+
+		ownid = os.getpid()
+
+		flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+		mode = ((os.R_OK | os.W_OK) << 6) | (os.R_OK << 3) | os.R_OK
+
+		try:
+			fd = os.open(self.pid_file,flags,mode)
+		except OSError, e:
+			logger.supervisor("PIDfile already exists, not updated %s" % self.pid_file)
+			return
+
+		try:
+			f = os.fdopen(fd,'w')
+			line = "%d\n" % ownid
+			f.write(line)
+			f.close()
+			self._saved_pid = True
+		except IOError, e:
+			logger.supervisor("Can not create PIDfile %s" % self.pid_file)
+			return
+		logger.supervisor("Created PIDfile %s with value %d" % (self.pid_file,ownid))
+
+	def removepid (self):
+		if not self.pid_file or not self._saved_pid:
+			return
+		try:
+			os.remove(self.pid_file)
+		except OSError, e:
+			if e.errno == errno.ENOENT:
+				pass
+			else:
+				logger.supervisor("Can not remove PIDfile %s" % self.pid_file)
+				return
+		logger.supervisor("Removed PIDfile %s" % self.pid_file)
+
+	def drop_privileges (self,name):
+		"""returns true if we are left with insecure privileges"""
+		# os.name can be ['posix', 'nt', 'os2', 'ce', 'java', 'riscos']
+		if os.name not in ['posix',]:
+			return False
+		
+		uid = os.getpid()
+		gid = os.getgid()
+
+		if uid and gid:
+			return False
+
+		try:
+			user = pwd.getpwnam(name)
+			nuid = int(user.pw_uid)
+			ngid = int(user.pw_uid)
+		except KeyError:
+			return True
+
+		# not sure you can change your gid if you do not have a pid of zero
+		try:
+			if not uid:
+				os.setuid(nuid)
+			if not gid:
+				os.setgid(ngid)
+			return False
+		except OSError,e:
+			return True
+
+	def sigterm (self,signum, frame):
+		logger.supervisor("SIG TERM received")
+		self._shutdown = True
+
+	def sighup (self,signum, frame):
+		logger.supervisor("SIG HUP received")
+		self._reload = True
+
+	def sigalrm (self,signum, frame):
+		logger.supervisor("SIG ALRM received")
+		self._restart = True
+
+	def run (self):
+		if self.drop_privileges(self.user):
+			logger.supervisor("Could not drop privileges to '%s' refusing to run as root" % self.user)
+			logger.supervisor("Set the environmemnt value USER to change the unprivileged user")
+			return
+		self.fork()
+		self.savepid()
+
+		# did we complete the run of updates caused by the last SIGHUP ?
+		reload_completed = True
+		
+		while self._peers:
+			try:
+				start = time.time()
+				
+				if self._shutdown:
+					self._shutdown = False
+					self.shutdown()
+				elif self._reload and reload_completed:
+					self._reload = False
+					self.reload()
+				elif self._restart:
+					self._restart = False
+					self.restart()
+				else:
+					watchdog = self.read_watchdogs()
+					for service in watchdog:
+						for command in watchdog[service]:
+							if command.startswith('announce watchdog '):
+								name = command.split(' ')[2]
+								self.watchdog[name] = 'announce'
+							elif command.startswith('withdraw watchdog '):
+								name = command.split(' ')[2]
+								self.watchdog[name] = 'withdraw'
+							else:
+								logger.supervisor("Command from watchdog not understood : %s" % command)
+
+				reload_completed = True
+				# Handle all connection
+				peers = self._peers.keys()
+				while peers:
+					for ip in peers[:]:
+						peer = self._peers[ip]
+						# there was no routes to send for this peer, we performed keepalive checks
+						if peer.run() is not True:
+							# no need to come back to it before a second
+							peers.remove(ip)
+					# otherwise process as many routes as we can within a second for the remaining peers
+					duration = time.time() - start
+					if duration >= 1.0:
+						reload_completed = False
+						break
+				duration = time.time() - start
+				# RFC state that we MUST not more than one KEEPALIVE / sec
+				if duration < 1.0:
+					time.sleep(1.0-duration)
+			except KeyboardInterrupt:
+				logger.supervisor("^C received")
+				self._shutdown = True
+		self.removepid()
+		self.terminate_watchdogs()
+
+	def shutdown (self):
+		"""terminate all the current BGP connections"""
+		logger.info("Performing shutdown","supervisor")
+		for ip in self._peers.keys():
+			self._peers[ip].stop()
+
+	def reload (self):
+		"""reload the configuration and send to the peer the route which changed"""
+		logger.info("Performing reload","configuration")
+		
+		reloaded = self.configuration.reload()
+		if not reloaded:
+			logger.info("Problem with the configuration file, no change done","configuration")
+			logger.info(configuration.error,"configuration")
+			return
+
+		for ip in self._peers.keys():
+			if ip not in self.configuration.neighbor.keys():
+				logger.supervisor("Removing Peer %s" % str(ip))
+				self._peers[ip].stop()
+
+		for ip in self.configuration.neighbor.keys():
+			neighbor = self.configuration.neighbor[ip]
+			# new peer
+			if ip not in self._peers.keys():
+				logger.supervisor("New Peer %s" % str(ip))
+				peer = Peer(neighbor,self)
+				self._peers[ip] = peer
+			else:
+				# check if the neighbor definition are the same (BUT NOT THE ROUTES)
+				if self._peers[ip].neighbor != neighbor:
+					logger.supervisor("Peer definition change, restarting %s" % str(ip))
+					self._peers[ip].restart(neighbor)
+				# set the new neighbor with the new routes
+				else:
+					logger.supervisor("Updating routes for %s" % str(ip))
+					self._peers[ip].reload(neighbor.routes())
+		logger.info("Loaded new configuration successfully",'configuration')
+		self.fork_watchdogs()
+
+	def restart (self):
+		"""kill the BGP session and restart it"""
+		logger.info("Performing restart","supervisor")
+		self.configuration.reload()
+
+		for ip in self._peers.keys():
+			if ip not in self.configuration.neighbor.keys():
+				logger.supervisor("Removing Peer %s" % str(ip))
+				self._peers[ip].stop()
+			else:
+				self._peers[ip].restart()
+		self.fork_watchdogs()
+
+	def unschedule (self,peer):
+		ip = peer.neighbor.peer_address.ip
+		if ip in self._peers:
+			del self._peers[ip]
+
+if __name__ == '__main__':
+	main = int(sys.version[0])
+	secondary = int(sys.version[2])
+
+	if main != 2 or secondary < 4:
+		sys.exit('This program can not work (is not tested) with your python version (< 2.4 or >= 3.0)')
+
+	if main == 2 and secondary == 4:
+		sys.stdout.write('\n')
+		sys.stdout.write('************ WARNING *** WARNING *** WARNING *** WARNING *********\n')
+		sys.stdout.write('* This program SHOULD work with your python version (2.4).       *\n')
+		sys.stdout.write('* No tests have been performed. Consider python 2.4 unsupported  *\n')
+		sys.stdout.write('* Please consider upgrading to the latest 2.x stable realease.   *\n')
+		sys.stdout.write('************ WARNING *** WARNING *** WARNING *** WARNING *********\n')
+		sys.stdout.write('\n')
+
+	if len(sys.argv) < 2:
+		sys.stdout.write('\n')
+		sys.stdout.write('*******************************************************************************\n')
+		sys.stdout.write('set the following environment values to gather information and report bugs\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('DEBUG_CONFIGURATION : verbose configuration parsing\n')
+		sys.stdout.write('DEBUG_SUPERVISOR : signal received, configuration reload (default: yes))\n')
+		sys.stdout.write('DEBUG_WIRE : the packet sent and received\n')
+		sys.stdout.write('DEBUG_RIB : change in route announcement in config reload\n')
+		sys.stdout.write('DEBUG_MESSAGE : changes in route announcement in config reload (default: yes)\n')
+		sys.stdout.write('DEBUG_TIMERS : tracking keepalives\n')
+		sys.stdout.write('PDB : on program fault, start pdb the python interactive debugger\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('USER : the user the program should try to use if run by root (default: nobody)\n')
+		sys.stdout.write('PID : the file in which the pid of the program should be stored\n')
+		sys.stdout.write('SYSLOG: no value for local syslog, a file name (which will auto-rotate) or host:<host> for remote syslog\n')
+		sys.stdout.write('DAEMONIZE: detach and send the program in the background\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('For example :\n')
+		sys.stdout.write('> env DEBUG_SUPERVISOR=0 DEBUG_WIRE=1 \\\n')
+		sys.stdout.write('     USER=wheel SYSLOG=host:127.0.0.1 DAEMONIZE= PID=/var/run/exabpg.pid \\\n')
+		sys.stdout.write('     ./bin/bgpd ./etc/bgp/configuration.txt\n')
+		sys.stdout.write('*******************************************************************************\n')
+		sys.stdout.write('\n')
+		sys.exit('usage:\n bgpd <configuration file>\n')
+	conf = sys.argv[1]
+
+	from bgp.configuration import Configuration
+
+	configuration = Configuration(conf)
+	if not configuration.reload():
+		sys.exit('%s' % configuration.error)
+	supervisor = Supervisor(configuration)
+	supervisor.run()
+	sys.exit(0)
