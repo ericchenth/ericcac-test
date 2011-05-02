@@ -1,0 +1,292 @@
+#!/usr/bin/env python
+# encoding: utf-8
+"""
+bgp.py
+
+Created by Thomas Mangin on 2009-08-30.
+Copyright (c) 2009 Exa Networks. All rights reserved.
+"""
+
+import sys
+import time
+import signal
+
+from bgp.network.peer import Peer
+from bgp.version import version
+
+from bgp.daemon import Daemon
+from bgp.processes import Processes
+from bgp.configuration import Configuration
+
+from bgp.log import Logger
+logger = Logger()
+
+
+class Supervisor (object):
+	# import os
+	# [hex(ord(c)) for c in os.popen('clear').read()]
+	clear = ''.join([chr(int(c,16)) for c in ['0x1b', '0x5b', '0x48', '0x1b', '0x5b', '0x32', '0x4a']])
+
+	def __init__ (self,configuration):
+		self.daemon = Daemon(self)
+		self.processes = Processes(self)
+		self.configuration = Configuration(configuration)
+
+		self.watchdogs = {}
+		self.commands = {}
+		self._peers = {}
+		self._shutdown = False
+		self._reload = False
+		self._restart = False
+		self._watchdog = False
+		self._commands = False
+		self._saved_pid = False
+		self.reload()
+
+		signal.signal(signal.SIGTERM, self.sigterm)
+		signal.signal(signal.SIGHUP, self.sighup)
+		signal.signal(signal.SIGALRM, self.sigalrm)
+
+	def sigterm (self,signum, frame):
+		logger.supervisor("SIG TERM received")
+		self._shutdown = True
+
+	def sighup (self,signum, frame):
+		logger.supervisor("SIG HUP received")
+		self._reload = True
+
+	def sigalrm (self,signum, frame):
+		logger.supervisor("SIG ALRM received")
+		self._restart = True
+
+	def run (self):
+		if self.daemon.drop_privileges():
+			logger.supervisor("Could not drop privileges to '%s' refusing to run as root" % self.daemon.user)
+			logger.supervisor("Set the environmemnt value USER to change the unprivileged user")
+			return
+		self.daemon.daemonise()
+		self.daemon.savepid()
+
+		# did we complete the run of updates caused by the last SIGHUP ?
+		reload_completed = True
+		
+		while self._peers:
+			try:
+				start = time.time()
+
+				self.handle_commands(self.processes.received())
+
+				if self._shutdown:
+					self._shutdown = False
+					self.shutdown()
+				elif self._reload and reload_completed:
+					self._reload = False
+					self.reload()
+				elif self._restart:
+					self._restart = False
+					self.restart()
+				elif self._watchdog:
+					self._watchdog = False
+					self.watchdog()
+				elif self._commands:
+					self._commands = False
+					self.commands(self.commands)
+					self.commands = {}
+
+				reload_completed = True
+				# Handle all connection
+				peers = self._peers.keys()
+				while peers:
+					for ip in peers[:]:
+						peer = self._peers[ip]
+						# there was no routes to send for this peer, we performed keepalive checks
+						if peer.run() is not True:
+							# no need to come back to it before a second
+							peers.remove(ip)
+					# otherwise process as many routes as we can within a second for the remaining peers
+					duration = time.time() - start
+					if duration >= 1.0:
+						reload_completed = False
+						break
+				duration = time.time() - start
+				# RFC state that we MUST not more than one KEEPALIVE / sec
+				if duration < 1.0:
+					time.sleep(1.0-duration)
+			except KeyboardInterrupt:
+				logger.supervisor("^C received")
+				self._shutdown = True
+		self.daemon.removepid()
+		self.processes.terminate()
+
+	def shutdown (self):
+		"""terminate all the current BGP connections"""
+		logger.info("Performing shutdown","supervisor")
+		for ip in self._peers.keys():
+			self._peers[ip].stop()
+
+	def reload (self):
+		"""reload the configuration and send to the peer the route which changed"""
+		logger.info("Performing reload","configuration")
+		
+		reloaded = self.configuration.reload()
+		if not reloaded:
+			logger.info("Problem with the configuration file, no change done","configuration")
+			logger.info(self.configuration.error,"configuration")
+			return
+
+		for ip in self._peers.keys():
+			if ip not in self.configuration.neighbor.keys():
+				logger.supervisor("Removing Peer %s" % str(ip))
+				self._peers[ip].stop()
+
+		for ip in self.configuration.neighbor.keys():
+			neighbor = self.configuration.neighbor[ip]
+			# new peer
+			if ip not in self._peers.keys():
+				logger.supervisor("New Peer %s" % str(ip))
+				peer = Peer(neighbor,self)
+				self._peers[ip] = peer
+			else:
+				# check if the neighbor definition are the same (BUT NOT THE ROUTES)
+				if self._peers[ip].neighbor != neighbor:
+					logger.supervisor("Peer definition change, restarting %s" % str(ip))
+					self._peers[ip].restart(neighbor)
+				# set the new neighbor with the new routes
+				else:
+					logger.supervisor("Updating routes for peer %s" % str(ip))
+					self._peers[ip].reload(neighbor.every_routes())
+		logger.info("Loaded new configuration successfully",'configuration')
+		self.processes.start()
+
+	def handle_commands (self,commands):
+		for service in commands:
+			for command in commands[service]:
+				# watchdog
+				if command.startswith('announce watchdog') or command.startswith('withdraw watchdog'):
+					parts = command.split(' ')
+					try:
+						name = parts[2]
+					except IndexError:
+						name = service
+					self.watchdogs[name] = parts[0]
+					self._watchdog = True
+
+				# route announcement / withdrawal
+				elif command.startswith('announce route'):
+					route = self.configuration.parse_single_route(command.split(' ')[1:])
+					if not route:
+						logger.supervisor("Command could not parse route in : %s" % command)
+					self.configuration.add_route_all_peers(route)
+					self._watchdog = True
+				elif command.startswith('withdraw route'):
+					route = self.configuration.parse_single_route(command.split(' ')[1:])
+					if not route:
+						logger.supervisor("Command could not parse route in : %s" % command)
+					else:
+						if self.configuration.remove_route_all_peers(route):
+							logger.supervisor("Command success, route found and removed : %s" % route)
+							self._watchdog = True
+						else:
+							logger.supervisor("Command failure, route not found : %s" % route)
+
+				# commands
+				elif command in ['shutdown','version']:
+					self.commands.setdefault(service,[]).append(command)
+					self._commands = True
+
+				# unknown
+				else:
+					logger.supervisor("Command from process not understood : %s" % command)
+
+	def commands (self,commands):
+		def _answer (service,string):
+			self.process.write(service,string)
+			logger.supervisor('Responding to %s : %s' % (service,string))
+		
+		for service in commands:
+			for command in commands[service]:
+				if command == 'shutdown':
+					self._shutdown = True
+					_answer(service,'shutdown in progress')
+					continue
+				if command == 'version':
+					_answer(service,'exabgp %s' % version)
+					continue
+
+	def watchdog (self):
+		"""the process ran and we need to figure what routes to changes"""
+		logger.supervisor("Performing dynamic route update")
+		
+		for ip in self.configuration.neighbor.keys():
+			neighbor = self.configuration.neighbor[ip]
+			neighbor.watchdog(self.watchdogs)
+			self._peers[ip].reload(neighbor.every_routes())
+		logger.supervisor("Updated peers dynamic routes successfully")
+
+	def restart (self):
+		"""kill the BGP session and restart it"""
+		logger.info("Performing restart","supervisor")
+		self.configuration.reload()
+
+		for ip in self._peers.keys():
+			if ip not in self.configuration.neighbor.keys():
+				logger.supervisor("Removing Peer %s" % str(ip))
+				self._peers[ip].stop()
+			else:
+				self._peers[ip].restart()
+		self.processes.start()
+
+	def unschedule (self,peer):
+		ip = peer.neighbor.peer_address.ip
+		if ip in self._peers:
+			del self._peers[ip]
+
+
+if __name__ == '__main__':
+	main = int(sys.version[0])
+	secondary = int(sys.version[2])
+
+	if main != 2 or secondary < 4:
+		sys.exit('This program can not work (is not tested) with your python version (< 2.4 or >= 3.0)')
+
+	if main == 2 and secondary == 4:
+		sys.stdout.write('\n')
+		sys.stdout.write('************ WARNING *** WARNING *** WARNING *** WARNING *********\n')
+		sys.stdout.write('* This program SHOULD work with your python version (2.4).       *\n')
+		sys.stdout.write('* No tests have been performed. Consider python 2.4 unsupported  *\n')
+		sys.stdout.write('* Please consider upgrading to the latest 2.x stable realease.   *\n')
+		sys.stdout.write('************ WARNING *** WARNING *** WARNING *** WARNING *********\n')
+		sys.stdout.write('\n')
+
+	if len(sys.argv) < 2:
+		sys.stdout.write('\n')
+		sys.stdout.write('*******************************************************************************\n')
+		sys.stdout.write('set the following environment values to gather information and report bugs\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('DEBUG_ALL : debug everything\n')
+		sys.stdout.write('DEBUG_CONFIGURATION : verbose configuration parsing\n')
+		sys.stdout.write('DEBUG_SUPERVISOR : signal received, configuration reload (default: yes))\n')
+		sys.stdout.write('DEBUG_DAEMON : pid change, forking, ... (default: yes))\n')
+		sys.stdout.write('DEBUG_PROCESSES : handling of forked processes (default: yes))\n')
+		sys.stdout.write('DEBUG_WIRE : the packet sent and received\n')
+		sys.stdout.write('DEBUG_RIB : change in route announcement in config reload\n')
+		sys.stdout.write('DEBUG_MESSAGE : changes in route announcement in config reload (default: yes)\n')
+		sys.stdout.write('DEBUG_TIMERS : tracking keepalives\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('PDB : on program fault, start pdb the python interactive debugger\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('USER : the user the program should try to use if run by root (default: nobody)\n')
+		sys.stdout.write('PID : the file in which the pid of the program should be stored\n')
+		sys.stdout.write('SYSLOG: no value for local syslog, a file name (which will auto-rotate) or host:<host> for remote syslog\n')
+		sys.stdout.write('DAEMONIZE: detach and send the program in the background\n')
+		sys.stdout.write('\n')
+		sys.stdout.write('For example :\n')
+		sys.stdout.write('> env DEBUG_SUPERVISOR=0 DEBUG_WIRE=1 \\\n')
+		sys.stdout.write('     USER=wheel SYSLOG=host:127.0.0.1 DAEMONIZE= PID=/var/run/exabpg.pid \\\n')
+		sys.stdout.write('     ./bin/bgpd ./etc/bgp/configuration.txt\n')
+		sys.stdout.write('*******************************************************************************\n')
+		sys.stdout.write('\n')
+		sys.exit('usage:\n bgpd <configuration file>\n')
+		
+	Supervisor(sys.argv[1]).run()
+	sys.exit(0)
